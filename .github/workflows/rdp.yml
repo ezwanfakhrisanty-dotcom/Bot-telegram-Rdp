@@ -1,0 +1,136 @@
+ame: RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    # Keep the temporary runner bounded. Do not use an infinite loop.
+    timeout-minutes: 60
+
+    steps:
+      - name: Configure Core RDP Settings
+        shell: powershell
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name "fDenyTSConnections" -Value 0 -Force
+
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "UserAuthentication" -Value 0 -Force
+
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "SecurityLayer" -Value 0 -Force
+
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+
+          Restart-Service -Name TermService -Force
+
+      - name: Create Temporary RDP User
+        shell: powershell
+        run: |
+          Add-Type -AssemblyName System.Security
+
+          $chars = @()
+          $chars += [char[]](65..90) | Get-Random -Count 4
+          $chars += [char[]](97..122) | Get-Random -Count 4
+          $chars += [char[]](48..57) | Get-Random -Count 4
+          $chars += ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126)) | Get-Random -Count 4
+
+          $password = -join ($chars | Sort-Object { Get-Random })
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+
+          # Mask password in GitHub logs.
+          Write-Output "::add-mask::$password"
+          "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+
+      - name: Install Tailscale
+        shell: powershell
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
+      - name: Establish Tailscale Connection
+        shell: powershell
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          if (-not $env:TAILSCALE_AUTH_KEY) {
+            throw "TAILSCALE_AUTH_KEY is not configured."
+          }
+
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
+            --authkey="$env:TAILSCALE_AUTH_KEY" `
+            --hostname="gh-runner-$env:GITHUB_RUN_ID"
+
+          $tsIP = $null
+          for ($i = 0; $i -lt 12; $i++) {
+            $candidate = (& "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4).Trim()
+            if ($candidate) {
+              $tsIP = $candidate
+              break
+            }
+            Start-Sleep -Seconds 5
+          }
+
+          if (-not $tsIP) {
+            throw "Tailscale IP was not assigned."
+          }
+
+          "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+      - name: Verify RDP Accessibility
+        shell: powershell
+        run: |
+          $result = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $result.TcpTestSucceeded) {
+            throw "RDP port 3389 is not reachable over Tailscale."
+          }
+
+      - name: Send Connection Details to Telegram
+        shell: powershell
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if (-not $env:TELEGRAM_BOT_TOKEN -or -not $env:TELEGRAM_CHAT_ID) {
+            throw "Telegram secrets are not configured."
+          }
+
+          $text = @"
+RDP READY
+
+Address: $env:TAILSCALE_IP
+Username: RDP
+Password: $env:RDP_PASSWORD
+
+Runner ID: $env:GITHUB_RUN_ID
+Lifetime: temporary GitHub Actions runner
+"@
+
+          $body = @{
+            chat_id = $env:TELEGRAM_CHAT_ID
+            text = $text
+          } | ConvertTo-Json
+
+          Invoke-RestMethod `
+            -Uri "https://api.telegram.org/bot$env:TELEGRAM_BOT_TOKEN/sendMessage" `
+            -Method Post `
+            -ContentType "application/json" `
+            -Body $body
+
+      - name: Keep RDP available temporarily
+        shell: powershell
+        run: |
+          # Bounded wait only; GitHub will terminate the runner at the job timeout.
+          Start-Sleep -Seconds 3300
+          
